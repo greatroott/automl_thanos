@@ -1,15 +1,22 @@
-from re import T
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.impute._base import _BaseImputer
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
+from sklearn.utils.validation import check_is_fitted, check_random_state
+from sklearn.ensemble import RandomForestClassifier as rfc
+from sklearn.ensemble import RandomForestRegressor as rfr
+from lightgbm import LGBMClassifier as lgbmc
+from lightgbm import LGBMRegressor as lgbmr
 import numpy as np
 from IPython.display import display
 import ipywidgets as wg   
 from ipywidgets import Layout 
 import sys 
+from typing import Optional 
+import gc 
+from _logging import get_logger
 from utils import infer_ml_usecase
 
 pd.set_option("display.max_columns",500)
@@ -21,6 +28,23 @@ def str_if_not_null(x):
     if pd.isnull(x) or (x is None) or pd.isna(x) or (x is not x) : 
         return x 
     return str(x)
+
+# Column Name cleaner transformer
+class Clean_Column_Names(BaseEstimator, TransformerMixin):
+    '''
+    - cleans special chars that are not supported by json format 
+    '''
+    def fit(self,data,y = None):
+        return self 
+
+    def transform(self, dataset,y = None):
+        data = dataset 
+        data.columns = data.columns.str.replace(r"[\,\}\{\]\[\:\"\']","") 
+        return data 
+
+    def fit_transform(self, dataset, y= None):
+        return self.transform(dataset,y = y)
+
 
 class DataTypes_Auto_infer(BaseEstimator, TransformerMixin):
     """
@@ -411,11 +435,397 @@ class Simple_Imputer(_BaseImputer):
         return self.transform(data)
 
 
-class Surrogate_Imputer(_BaseImputer):
+class Iterative_Imputer(_BaseImputer):
     """
-    
-    
+    Multivariate imputer that estimates each feature from all the others. 
+
+    A strategy for imputing missing values by modeling each feature with missing values as a function of other features in a round-robin fashion.
+
     """
+    def __init__(
+        self,
+        regressor: BaseEstimator,
+        classifier: BaseEstimator,
+        *,
+        target = None,
+        missing_values = np.nan, # missing은 np.nan으로 처리
+        initial_strategy_numeric: str = "mean",
+        initial_strategy_categorical: str = "most_frequent",
+        ordinal_columns: Optional[list] = None,
+        max_iter: int =10, 
+        warm_start: bool = False, 
+        imputation_order: str = "ascending",
+        verbose: int = 0,
+        random_state: int = None,
+        add_indicator: bool = False  
+        ):
+        super().__init__(missing_values = missing_values, add_indicator = add_indicator)
+        self.regressor = regressor 
+        self.classifier = classifier 
+        self.initial_strategy_numeric = initial_strategy_numeric
+        self.initial_strategy_categorical = initial_strategy_categorical 
+        self.max_iter = max_iter 
+        self.warm_start = warm_start 
+        self.imputation_order = imputation_order 
+        self.verbose = verbose
+        self.random_state = random_state
+        self.target = target
+        if ordinal_columns is None: 
+            ordinal_columns = []
+        self.ordinal_columns = list(ordinal_columns)
+        self._column_cleaner = Clean_Column_Names()
+
+    def _initial_imputation(self,X):
+        '''
+        Imputer used to initialize the missing values.
+        '''
+        if self.initial_imputer_ is None:
+            self.initial_imputer_ = Simple_Imputer(
+                target_variable = "__TARGET__", # dummy value, we don;t actally want to drop anything
+                numeric_strategy = self.initial_strategy_numeric,
+                categorical_strategy = self.initial_strategy_categorical
+            ) 
+            X_filled = self.initial_imputer_.fit_transform(X)
+        else:
+            X_filled = self.initial_imputer_.transform(X)
+
+        
+        return X_filled 
+
+    def _impute_one_feature(self, X, column, X_na_mask, fit):
+        if not fit:
+            check_is_fitted(self)
+        is_classification = (
+            X[column].dtype.name == "object" or column in self.ordinal_columns
+        )
+        if is_classification:
+            if column in self.classifiers_:
+                time, dummy, le, estimator = self.classifiers_[column]
+            elif not fit:
+                return X
+            else:
+                estimator = clone(self._classifier)
+                time = Make_Time_Features()
+                dummy = Dummify(column)
+                le = LabelEncoder()
+        else:
+            if column in self.regressors_:
+                time, dummy, le, estimator = self.regressors_[column]
+            elif not fit:
+                return X
+            else:
+                estimator = clone(self._regressor)
+                time = Make_Time_Features()
+                dummy = Dummify(column)
+                le = None
+
+        if fit:
+            fit_kwargs = {}
+            X_train = X[~X_na_mask[column]]
+            y_train = X_train[column]
+            # catboost handles categoricals itself
+            if "catboost" not in str(type(estimator)).lower():
+                X_train = time.fit_transform(X_train)
+                X_train = dummy.fit_transform(X_train)
+                X_train.drop(column, axis=1, inplace=True)
+            else:
+                X_train.drop(column, axis=1, inplace=True)
+                fit_kwargs["cat_features"] = []
+                for i, col in enumerate(X_train.columns):
+                    if X_train[col].dtype.name == "object":
+                        X_train[col] = pd.Categorical(
+                            X_train[col], ordered=column in self.ordinal_columns
+                        )
+                        fit_kwargs["cat_features"].append(i)
+                fit_kwargs["cat_features"] = np.array(
+                    fit_kwargs["cat_features"], dtype=int
+                )
+            X_train = self._column_cleaner.fit_transform(X_train)
+
+            if le:
+                y_train = le.fit_transform(y_train)
+
+            try:
+                assert self.warm_start
+                estimator.partial_fit(X_train, y_train)
+            except:
+                estimator.fit(X_train, y_train, **fit_kwargs)
+
+        X_test = X.drop(column, axis=1)[X_na_mask[column]]
+        X_test = time.transform(X_test)
+        # catboost handles categoricals itself
+        if "catboost" not in str(type(estimator)).lower():
+            X_test = dummy.transform(X_test)
+        else:
+            for col in X_test.select_dtypes("object").columns:
+                X_test[col] = pd.Categorical(
+                    X_test[col], ordered=column in self.ordinal_columns
+                )
+        result = estimator.predict(X_test)
+        if le:
+            result = le.inverse_transform(result)
+
+        if fit:
+            if is_classification:
+                self.classifiers_[column] = (time, dummy, le, estimator)
+            else:
+                self.regressors_[column] = (time, dummy, le, estimator)
+
+        if result.dtype.name == "float64":
+            result = result.astype("float32")
+
+        X_test[column] = result
+        X.update(X_test[column])
+
+        gc.collect()
+
+        return X
+
+    def _impute(self, X, fit: bool):
+        if self.target in X.columns:
+            target_column = X[self.target]
+            X = X.drop(self.target, axis=1)
+        else:
+            target_column = None
+
+        original_columns = X.columns
+        original_index = X.index
+
+        X = X.reset_index(drop=True)
+        X = self._column_cleaner.fit_transform(X)
+
+        self.imputation_sequence_ = (
+            X.isnull().sum().sort_values(ascending=self.imputation_order == "ascending")
+        )
+        self.imputation_sequence_ = [
+            col
+            for col in self.imputation_sequence_[self.imputation_sequence_ > 0].index
+            if X[col].dtype.name != "datetime64[ns]"
+        ]
+
+        X_na_mask = X.isnull()
+
+        X_imputed = self._initial_imputation(X.copy())
+
+        for i in range(self.max_iter if fit else 1):
+            for feature in self.imputation_sequence_:
+                get_logger().info(f"Iterative Imputation: {i+1} cycle | {feature}")
+                X_imputed = self._impute_one_feature(X_imputed, feature, X_na_mask, fit)
+
+        X_imputed.columns = original_columns
+        X_imputed.index = original_index
+
+        if target_column is not None:
+            X_imputed[self.target] = target_column
+        return X_imputed
+
+    def transform(self, X, y=None, **fit_params):
+        return self._impute(X, fit=False)
+
+    def fit_transform(self, X, y=None, **fit_params):
+        self.random_state_ = getattr(
+            self, "random_state_", check_random_state(self.random_state)
+        )
+        if self.regressor is None:
+            raise ValueError("No regressor provided")
+        else:
+            self._regressor = clone(self.regressor)
+        try:
+            self._regressor.set_param(random_state=self.random_state_)
+        except:
+            pass
+        if self.classifier is None:
+            raise ValueError("No classifier provided")
+        else:
+            self._classifier = clone(self.classifier)
+        try:
+            self._classifier.set_param(random_state=self.random_state_)
+        except:
+            pass
+
+        self.classifiers_ = {}
+        self.regressors_ = {}
+
+        self.initial_imputer_ = None
+
+        return self._impute(X, fit=True)
+
+    def fit(self, X, y=None, **fit_params):
+        self.fit_transform(X, y=y, **fit_params)
+
+        return self
+
+
+# make dummy variables
+class Dummify(BaseEstimator, TransformerMixin):
+    """
+    - makes one hot encoded variables for dummy variable
+    - it is HIGHLY recommended to run the Select_Data_Type class first
+    - Ignores target variable
+      Args: 
+        target: string , name of the target variable
+  """
+
+    def __init__(self, target):
+        self.target = target
+
+        # creat ohe object
+        self.ohe = OneHotEncoder(handle_unknown="ignore", dtype=np.float32)
+
+    def fit(self, dataset, y=None):
+        data = dataset
+        # will only do this if there are categorical variables
+        if len(data.select_dtypes(include=("object")).columns) > 0:
+            # we need to learn the column names once the training data set is dummify
+            # save non categorical data
+            self.data_nonc = data.drop(
+                self.target, axis=1, errors="ignore"
+            ).select_dtypes(exclude=("object"))
+            self.target_column = data[[self.target]]
+            # # plus we will only take object data types
+            categorical_data = data.drop(
+                self.target, axis=1, errors="ignore"
+            ).select_dtypes(include=("object"))
+            # # now fit the trainin column
+            self.ohe.fit(categorical_data)
+            self.data_columns = self.ohe.get_feature_names(categorical_data.columns)
+
+        return self
+
+    def transform(self, dataset, y=None):
+        data = dataset.copy()
+        # will only do this if there are categorical variables
+        if len(data.select_dtypes(include=("object")).columns) > 0:
+            # only for test data
+            self.data_nonc = data.drop(
+                self.target, axis=1, errors="ignore"
+            ).select_dtypes(exclude=("object"))
+            # fit without target and only categorical columns
+            array = self.ohe.transform(
+                data.drop(self.target, axis=1, errors="ignore").select_dtypes(
+                    include=("object")
+                )
+            ).toarray()
+            data_dummies = pd.DataFrame(array, columns=self.data_columns)
+            data_dummies.index = self.data_nonc.index
+            if self.target in data.columns:
+                target_column = data[[self.target]]
+            else:
+                target_column = None
+            # now put target , numerical and categorical variables back togather
+            data = pd.concat((target_column, self.data_nonc, data_dummies), axis=1)
+            del self.data_nonc
+            return data
+        else:
+            return data
+
+    def fit_transform(self, dataset, y=None):
+        data = dataset.copy()
+        # will only do this if there are categorical variables
+        if len(data.select_dtypes(include=("object")).columns) > 0:
+            self.fit(data)
+            # fit without target and only categorical columns
+            array = self.ohe.transform(
+                data.drop(self.target, axis=1, errors="ignore").select_dtypes(
+                    include=("object")
+                )
+            ).toarray()
+            data_dummies = pd.DataFrame(array, columns=self.data_columns)
+            data_dummies.index = self.data_nonc.index
+            # now put target , numerical and categorical variables back togather
+            data = pd.concat((self.target_column, self.data_nonc, data_dummies), axis=1)
+            # remove unwanted attributes
+            del (self.target_column, self.data_nonc)
+            return data
+        else:
+            return data
+
+
+# Time feature extractor
+class Make_Time_Features(BaseEstimator, TransformerMixin):
+    """
+    -Given a time feature , it extracts more features
+    - Only accepts / works where feature / data type is datetime64[ns]
+    - full list of features is:
+      ['month','weekday',is_month_end','is_month_start','hour']
+    - all extracted features are defined as string / object
+    -it is recommended to run Define_dataTypes first
+      Args: 
+        time_feature: list of feature names as datetime64[ns] , default empty/none , if empty/None , it will try to pickup dates automatically where data type is datetime64[ns]
+        list_of_features: list of required features , default value ['month','weekday','is_month_end','is_month_start','hour']
+  """
+
+    def __init__(
+        self,
+        time_feature=None,
+        list_of_features=["month", "weekday", "is_month_end", "is_month_start", "hour"],
+    ):
+        self.time_feature = time_feature
+        self.list_of_features_o = set(list_of_features)
+
+    def fit(self, data, y=None):
+        if self.time_feature is None:
+            self.time_feature = data.select_dtypes(include=["datetime64[ns]"]).columns
+            self.has_hour_ = set()
+            for i in self.time_feature:
+                if "hour" in self.list_of_features_o:
+                    if any(x.hour for x in data[i]):
+                        self.has_hour_.add(i)
+        return self
+
+    def transform(self, dataset, y=None):
+        data = dataset.copy()
+        # run fit transform first
+
+        def get_time_features(r):
+            features = []
+            if "month" in self.list_of_features_o:
+                features.append(("_month", str(r.month)))
+            if "weekday" in self.list_of_features_o:
+                features.append(("_weekday", str(r.weekday())))
+            if "is_month_end" in self.list_of_features_o:
+                features.append(
+                    (
+                        "_is_month_end",
+                        "1"
+                        if calendar.monthrange(r.year, r.month)[1] == r.day
+                        else "0",
+                    )
+                )
+            if "is_month_start" in self.list_of_features_o:
+                features.append(("_is_month_start", "1" if r.day == 1 else "0"))
+            return tuple(features)
+
+        # start making features for every column in the time list
+        for i in self.time_feature:
+            list_of_features = [get_time_features(r) for r in data[i]]
+
+            fd = defaultdict(list)
+            for x in list_of_features:
+                for k, v in x:
+                    fd[k].append(v)
+
+            for k, v in fd.items():
+                data[i + k] = v
+
+            # make hour column if choosen
+            if "hour" in self.list_of_features_o and i in self.has_hour_:
+                h = [r.hour for r in data[i]]
+                data[f"{i}_hour"] = h
+                data[f"{i}_hour"] = data[f"{i}_hour"].apply(str)
+
+        # we dont need time columns any more
+        data.drop(self.time_feature, axis=1, inplace=True)
+
+        return data
+
+    def fit_transform(self, dataset, y=None):
+        # if no columns names are given , then pick datetime columns
+        self.fit(dataset, y=y)
+
+        return self.transform(dataset, y=y)
+
+
 
 # now get the replacement dict
 def _get_labelencoder_reverse_dict(le: LabelEncoder) -> dict:
@@ -435,7 +845,14 @@ def preprocess_all_in_one(
     id_columns = [],
     imputation_type = "simple",
     numeric_imputation_strategy = "mean",
-    categorical_imputation_strategy = "not_available"):
+    categorical_imputation_strategy = "not_available",
+    imputation_classifier = None,
+    imputation_regressor = None,
+    imputation_max_iter = 10, 
+    imputation_warm_start = False,
+    imputation_order = "ascending",
+    ordinal_columns_and_categories = {}, 
+    random_state =42,n_jobs = -1):
     """
     Following preprocess steps are taken: 
     - 1) Auto infer data types (you can designate types) : id_columns가 있으면 직접 넣어줘야 합니다. 
@@ -474,11 +891,29 @@ def preprocess_all_in_one(
             categorical_strategy = categorical_imputation_strategy
         )
     else: 
+        # 만약 option에서 이 파트가 없으면 아예 제외해서 집어넣는다~ 
+        # 우선 lightgbm으로만 적용
+        if imputation_classifier == None:
+            imputation_classifier = lgbmc(n_estimators=100, max_depth =5 , n_jobs =n_jobs, random_state = random_state)
+        if imputation_regressor == None:
+            imputation_regressor = lgbmr(n_estimators=100, max_depth =5, n_jobs= n_jobs, random_state= random_state)
+        
+        imputer = Iterative_Imputer(
+            classifier = imputation_classifier,
+            regressor = imputation_regressor, 
+            target = target_variable, 
+            initial_strategy_numeric = numeric_imputation_strategy, 
+            max_iter = imputation_max_iter, 
+            warm_start = imputation_warm_start,
+            imputation_order = imputation_order, 
+            random_state = random_state, 
+            ordinal_columns = ordinal_columns_and_categories.keys())
 
 
 
     pipe = Pipeline([
         ("dtypes", dtypes),
-        ("imputer",imputer)
+        (SKLEARN_EMPTY_STEP,imputer)
     ])
+
     return pipe 

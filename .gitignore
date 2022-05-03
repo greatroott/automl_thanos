@@ -1,2 +1,4 @@
 *.ipynb\
 _pycache_\
+*/csv\
+*/logs.log

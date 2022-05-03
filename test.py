@@ -21,12 +21,14 @@ for i in ['titanic','costarican','home-credit','porto','walmart']:
 
     df = pd.read_csv(os.path.join(data_path,f"{i}/train.csv"))
     test = pd.read_csv(os.path.join(data_path,f"{i}/test.csv"))
-    print(df.isnull().sum())
-
-    pipe = preprocess_all_in_one(train_data = df, target_variable = target_, ml_usecase = "classification",test_data =test ,display_types= False)
-
+    df.iloc[:,(df.isnull().sum()!=0).values].to_csv(f"./origin_{i}.csv",index=False)
+    pipe = preprocess_all_in_one(train_data = df, target_variable = target_, ml_usecase = "classification",test_data =test ,display_types= False,imputation_type = "simple")
+    check = pd.read_csv(f"./origin_{i}.csv")
+    check_cols = check.columns
     fit_transform_test = pipe.fit_transform(df)
-    print(fit_transform_test.isnull().sum())
+    
+    check = pd.concat([check, fit_transform_test[check_cols]],axis=1)
+    check.to_csv(f"./origin_{i}.csv",index=False)
 
     print(f"{i}-test_set_Apply no error")
 
